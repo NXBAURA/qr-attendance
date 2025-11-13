@@ -1,161 +1,128 @@
-# app2.py (replace your file with this)
+# app2.py - QR Attendance app WITHOUT writing to disk (in-memory only)
+import streamlit as st, hashlib, pathlib
+sha = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest() if pathlib.Path(__file__).exists() else "no-file"
+st.sidebar.text(f"app2.py SHA: {sha[:12]}")
+
 import streamlit as st
-import pandas as pd
+from pathlib import Path
 import qrcode
-from PIL import Image
-import io, os, hashlib, datetime
+from io import BytesIO, StringIO
+import time
+from datetime import datetime
+import uuid
+import urllib.parse
+import csv
 
-# ---------------- CONFIG ----------------
-st.set_page_config(page_title="QR Attendance", layout="wide")
-SLOT_MINUTES = 5
-# SECRET & ADMIN_PASSWORD should be set in Streamlit secrets or environment
-SECRET = st.secrets.get("QR_SECRET", os.environ.get("QR_SECRET", "change_this_secret"))
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", os.environ.get("ADMIN_PASSWORD", "admin123"))
-BASE_URL = st.secrets.get("BASE_URL", os.environ.get("BASE_URL", "http://localhost:8501"))
+st.set_page_config(page_title="QR Attendance Marker", layout="centered")
 
-# ---------------- HELPERS ----------------
-def now():
-    return datetime.datetime.now()
+# ---------- Config / Secrets ----------
+QR_SECRET = st.secrets.get("QR_SECRET", "dev-secret")
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
+BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")
 
-def slot_index(dt=None, minutes=SLOT_MINUTES):
-    dt = dt or now()
-    return int(dt.timestamp() // (minutes * 60))
+# ---------- Session-state storage ----------
+if "attendance_rows" not in st.session_state:
+    st.session_state.attendance_rows = []  # list of dicts: {timestamp, slot_key, name, email}
 
-def slot_key_for_index(idx, secret=SECRET):
-    data = f"{idx}:{secret}"
-    return hashlib.sha256(data.encode()).hexdigest()[:20]
+# ---------- Helpers ----------
+def now_iso_utc():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def make_qr_image(text, box_size=8, border=2):
-    qr = qrcode.QRCode(box_size=box_size, border=border)
-    qr.add_data(text)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    return img
+def gen_slot_key():
+    return uuid.uuid4().hex
 
-def downloads_path():
-    # cross-platform path to Downloads
-    return os.path.join(os.path.expanduser("~"), "Downloads")
+def build_qr_link(slot_key: str):
+    params = {"key": slot_key, "s": QR_SECRET}
+    return f"{BASE_URL}/?{urllib.parse.urlencode(params)}"
 
-def attendance_filename_for_today():
-    return os.path.join(downloads_path(), f"attendance_{now().strftime('%Y-%m-%d')}.csv")
+def make_qr_bytes(link: str):
+    img = qrcode.make(link)
+    b = BytesIO()
+    img.save(b, format="PNG")
+    b.seek(0)
+    return b
 
-def save_attendance_row(row):
-    fname = attendance_filename_for_today()
-    header = not os.path.exists(fname)
-    df = pd.DataFrame([row])
-    df.to_csv(fname, mode="a", header=header, index=False)
+def attendance_to_csv_string(rows):
+    if not rows:
+        return ""
+    output = StringIO()
+    fieldnames = list(rows[0].keys())
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
 
-def load_attendance_all():
-    # load today's file only (keeps things simple)
-    fname = attendance_filename_for_today()
-    if os.path.exists(fname):
-        return pd.read_csv(fname)
-    return pd.DataFrame(columns=["timestamp","slot_index","slot_key","name","email"])
+# ---------- Slot rotate ----------
+SLOT_TTL = 300  # 5 minutes
+if "slot_key" not in st.session_state:
+    st.session_state.slot_key = gen_slot_key()
+    st.session_state.slot_created = time.time()
 
-def seconds_until_next_slot(minutes=SLOT_MINUTES):
-    i = slot_index()
-    return int((i + 1) * (minutes * 60) - int(now().timestamp()))
+if time.time() - st.session_state.slot_created > SLOT_TTL:
+    st.session_state.slot_key = gen_slot_key()
+    st.session_state.slot_created = time.time()
 
-def already_marked(email, slot_idx):
-    df = load_attendance_all()
-    if df.empty: return False
-    return ((df["email"].astype(str).str.lower() == email.lower()) & (df["slot_index"] == slot_idx)).any()
+slot_key = st.session_state.slot_key
+expires_in = int(SLOT_TTL - (time.time() - st.session_state.slot_created))
 
-# ---------------- CSS (cleaner look) ----------------
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #0f1113; color: #ddd; }
-    .card { padding: 18px; border-radius: 10px; background: #0b1112; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
-    .muted { color: #a6a6a6; font-size:14px; }
-    .small { font-size:13px; color:#cfcfcf; }
-    .qr-col { display:flex; align-items:center; justify-content:center; flex-direction:column; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------- UI ----------------
+# ---------- UI ----------
 st.title("📋 QR Attendance Marker")
-col_left, col_right = st.columns([1, 1.4])
+st.subheader("Admin — Current QR")
+st.write("Current slot key:", f"`{slot_key}`")
+st.write(f"QR refreshes every 5 minutes • refresh in **{expires_in}s**")
 
-# Left: admin QR
-with col_left:
-    st.subheader("Admin — Current QR")
-    cur_idx = slot_index()
-    cur_key = slot_key_for_index(cur_idx)
-    link = f"{BASE_URL}/?key={cur_key}"
-    img = make_qr_image(link)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    st.image(buf.getvalue(), width=260)
-    st.caption(f"Current slot key: `{cur_key}`")
-    st.write(f"QR refreshes every {SLOT_MINUTES} minutes • refresh in **{seconds_until_next_slot()}s**", unsafe_allow_html=True)
-
-    # Admin unlock
-    if "admin_unlocked" not in st.session_state:
-        st.session_state.admin_unlocked = False
-
-    pw = st.text_input("Admin password (to view records)", type="password")
-    if st.button("Unlock admin"):
+with st.expander("Admin — View records (enter password)"):
+    pw = st.text_input("Admin password", type="password")
+    if st.button("View records"):
         if pw == ADMIN_PASSWORD:
-            st.session_state.admin_unlocked = True
-            st.success("Admin unlocked — you can now view/download the day's attendance.")
-        else:
-            st.error("Wrong password")
-
-    if st.session_state.admin_unlocked:
-        st.markdown("---")
-        st.subheader("Attendance (today)")
-        df = load_attendance_all()
-        st.write(f"Records for: **{now().strftime('%Y-%m-%d')}**")
-        if df.empty:
-            st.info("No records yet.")
-        else:
-            st.dataframe(df.sort_values("timestamp", ascending=False).reset_index(drop=True))
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV (today)", data=csv, file_name=os.path.basename(attendance_filename_for_today()), mime="text/csv")
-        # Optional: lock admin out button
-        if st.button("Lock admin"):
-            st.session_state.admin_unlocked = False
-            st.experimental_rerun()
-
-# Right: public form
-with col_right:
-    st.subheader("Mark Your Attendance")
-    st.info("Scan the admin QR (or open the link). Only the QR key in the link will be accepted for the current slot.")
-    # use modern API
-    qparams = st.query_params
-    key_from_url = qparams.get("key", [None])[0] if isinstance(qparams.get("key", None), list) else qparams.get("key", None)
-    # UI fields
-    name = st.text_input("Full Name")
-    email = st.text_input("Email")
-
-    if st.button("Mark Attendance"):
-        if not name or not email:
-            st.error("Please fill in all fields.")
-        elif key_from_url is None:
-            st.error("No key detected. Open the link that contains `?key=...` or scan the admin QR.")
-        else:
-            # accept small drift (current slot)
-            accepted = {slot_key_for_index(i) for i in range(slot_index() - 1, slot_index() + 2)}
-            if key_from_url not in accepted:
-                st.error("Invalid or expired QR key. Re-scan the admin QR.")
+            rows = st.session_state.attendance_rows
+            if not rows:
+                st.info("No attendance records in memory yet.")
             else:
-                sidx = slot_index()
-                if already_marked(email, sidx):
-                    st.warning("You already marked attendance for this slot.")
-                else:
-                    row = {
-                        "timestamp": now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "slot_index": sidx,
-                        "slot_key": key_from_url,
-                        "name": name.strip(),
-                        "email": email.strip().lower()
-                    }
-                    save_attendance_row(row)
-                    st.success(f"Attendance saved for {name} at {row['timestamp']}.\nSaved to your Downloads folder.")
-
+                st.dataframe(rows)
+                csv_str = attendance_to_csv_string(rows)
+                st.download_button("Download CSV (current in-memory data)", csv_str, "attendance.csv", "text/csv")
+        else:
+            st.error("Wrong admin password.")
 
 st.markdown("---")
-st.markdown("<div class='small'>Files saved to your Downloads folder with filename like <code>attendance_YYYY-MM-DD.csv</code>. Only the admin (password) can view the list/download. If you deploy to Streamlit Cloud, store secrets there (QR_SECRET, ADMIN_PASSWORD, BASE_URL).</div>", unsafe_allow_html=True)
+st.header("Mark Your Attendance")
+st.write("Scan the admin QR (or open the link). Only the QR key in the link will be accepted for the current slot.")
+
+# show QR
+qr_link = build_qr_link(slot_key)
+st.image(make_qr_bytes(qr_link), width=220, caption="Scan this QR or open link below.")
+st.write("Or open link:", qr_link)
+
+# check query params (user came via QR)
+params = st.experimental_get_query_params()
+valid_qr = False
+if "key" in params and "s" in params:
+    if params.get("s", [""])[0] == QR_SECRET and params.get("key", [""])[0] == slot_key:
+        valid_qr = True
+    else:
+        st.warning("QR is invalid or expired. Use the latest QR from the admin panel.")
+
+with st.form("attendance_form"):
+    name = st.text_input("Full Name")
+    email = st.text_input("Email")
+    submitted = st.form_submit_button("Mark Attendance")
+
+if submitted:
+    if not name.strip() or not email.strip():
+        st.error("Enter both name and email.")
+    elif not valid_qr:
+        st.error("You must open the form via a valid admin QR link for this slot.")
+    else:
+        row = {
+            "timestamp": now_iso_utc(),
+            "slot_key": slot_key,
+            "name": name.strip(),
+            "email": email.strip()
+        }
+        st.session_state.attendance_rows.append(row)
+        st.success("Attendance marked — thank you!")
+        # show count
+        st.info(f"Total records in memory: {len(st.session_state.attendance_rows)}")
+
+st.caption("NOTE: This version does not save data to disk. Data is kept in-memory and will be lost if the app restarts. If you need persistent storage, I can add Google Sheets / Airtable / remote DB next.")
