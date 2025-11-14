@@ -1,20 +1,13 @@
-# app2.py - Simplified reliable QR attendance (shared slot + direct link + mobile-safe)
+# app2.py - cleaned: no debug, formatted timestamps, export tidy XLSX/CSV (cid recorded but not exported)
 import streamlit as st
 from pathlib import Path
 import qrcode
 from io import BytesIO
-import csv
-import time
-import os
+import csv, json, os, time, urllib.parse, hashlib, uuid
 from datetime import datetime
-import uuid
-import urllib.parse
-import hashlib
 import pandas as pd
-import json
-import html
 
-# ---------- basic page config ----------
+# ----------- page & SHA -----------
 st.set_page_config(page_title="QR Attendance", layout="centered")
 try:
     sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
@@ -22,19 +15,18 @@ except Exception:
     sha = "no-sha"
 st.sidebar.text(f"app2.py SHA: {sha}")
 
-# ---------- secrets/config ----------
+# ----------- secrets & config -----------
 QR_SECRET = st.secrets.get("QR_SECRET", "changeme")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
-BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")  # must match your app host exactly
+BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")
 
-# ---------- paths ----------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH = DATA_DIR / "attendance.csv"
 SLOT_FILE = DATA_DIR / "current_slot.json"
-SLOT_TTL = 300  # 5 minutes
+SLOT_TTL = 300  # seconds
 
-# ---------- helpers ----------
+# ----------- helpers -----------
 def now_iso_utc():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
@@ -46,8 +38,7 @@ def atomic_write_json(path: Path, data: dict):
     tmp.replace(path)
 
 def read_slot_file(path: Path):
-    if not path.exists():
-        return None
+    if not path.exists(): return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -79,9 +70,7 @@ def build_link(slot_key: str, cid: str = None):
 
 def make_qr_bytes(link: str):
     img = qrcode.make(link)
-    b = BytesIO()
-    img.save(b, format="PNG")
-    b.seek(0)
+    b = BytesIO(); img.save(b, format="PNG"); b.seek(0)
     return b
 
 def safe_append_csv(row: dict):
@@ -105,94 +94,94 @@ def read_df():
     except Exception:
         return pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"])
 
+def df_for_admin_display(df: pd.DataFrame):
+    # copy only the useful columns and format timestamp
+    if df.empty:
+        return df
+    df2 = df.copy()
+    # convert ISO timestamp to local datetime string
+    def fmt_ts(x):
+        try:
+            dt = datetime.fromisoformat(x.replace("Z", ""))
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return x
+    if "timestamp" in df2.columns:
+        df2["timestamp"] = df2["timestamp"].apply(fmt_ts)
+    # select visible columns in order
+    cols = [c for c in ["timestamp","slot_key","name","email"] if c in df2.columns]
+    return df2[cols]
+
 def df_to_excel_bytes(df: pd.DataFrame):
+    # produce an Excel file with human-friendly timestamp column
+    df2 = df_for_admin_display(df)
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="attendance")
+        df2.to_excel(writer, index=False, sheet_name="attendance")
     bio.seek(0)
     return bio.getvalue()
 
-# ---------- get the shared slot ----------
+# ----------- shared slot ----------
 slot_key, slot_created = ensure_current_slot(SLOT_TTL)
 expires_in = int(SLOT_TTL - (time.time() - slot_created))
-canonical_link = build_link(slot_key)  # link without cid
+canonical_link = build_link(slot_key)
 
-# ---------- UI ----------
-st.title("📋 QR Attendance Marker — simplified")
+# ----------- UI (simplified) -----------
+st.title("📋 QR Attendance Marker")
 
-cols = st.columns([1,1])
-with cols[0]:
+col1, col2 = st.columns([1,1])
+with col1:
     st.subheader("Admin — Current QR")
     st.write("Current slot key:", f"`{slot_key}`")
     st.write(f"QR refreshes every 5 minutes • refresh in **{expires_in}s**")
     st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with camera")
-
-    # show direct link plainly and buttons
-    st.markdown("**Direct link (click to open):**")
-    # plain clickable markdown link (works in tab)
     st.markdown(f"[Open direct attendance link]({canonical_link})")
-    # copy & open-in-new-tab via JS
+    # open new tab & copy buttons
     js = f"""
-    <div style="margin-top:6px;">
-      <button id="openNew" style="padding:8px 12px;border-radius:6px;background:#2b6cb0;color:white;border:none;">Open in new tab</button>
-      <button id="copyBtn" style="padding:8px 12px;border-radius:6px;background:#4a5568;color:white;border:none;margin-left:8px;">Copy link</button>
-    </div>
+    <button onclick="window.open('{canonical_link}','_blank')" style="padding:8px 10px;margin-right:8px;">Open in new tab</button>
+    <button id="copyBtn">Copy link</button>
     <script>
-      document.getElementById('openNew').onclick = function() {{
-        window.open("{canonical_link}", "_blank");
-      }};
       document.getElementById('copyBtn').onclick = async function() {{
-        try {{ await navigator.clipboard.writeText("{canonical_link}"); this.innerText = "Copied"; setTimeout(()=>this.innerText="Copy link",1200); }}
-        catch(e) {{ alert('Copy failed — long-press the link to copy.'); }}
+        try {{ await navigator.clipboard.writeText('{canonical_link}'); this.innerText='Copied'; setTimeout(()=>this.innerText='Copy link',1200); }}
+        catch(e) {{ alert('Copy failed'); }}
       }};
     </script>
     """
-    st.components.v1.html(js, height=70)
+    st.components.v1.html(js, height=60)
 
-with cols[1]:
+with col2:
     st.markdown("### Open on this device (mobile-safe)")
-    st.write("Click here on the device/browser where you want to submit — it will store a browser id (cid) and open the valid link with `&cid=...`.")
     js2 = f"""
     <script>
-    function getCid() {{
-      try {{
-        let cid = localStorage.getItem("attendance_cid");
-        if(!cid) {{ cid = (crypto && crypto.randomUUID) ? crypto.randomUUID() : "{uuid.uuid4().hex}"; localStorage.setItem("attendance_cid", cid); }}
-        return cid;
-      }} catch(e) {{ return "{uuid.uuid4().hex}"; }}
-    }}
-    function openWithCid() {{
-      const cid = encodeURIComponent(getCid());
-      const url = "{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid=" + cid;
-      window.location.href = url;
-    }}
+      function getCid() {{
+        try {{
+          let cid = localStorage.getItem('attendance_cid');
+          if(!cid){{ cid = (crypto && crypto.randomUUID)? crypto.randomUUID() : '{uuid.uuid4().hex}'; localStorage.setItem('attendance_cid', cid); }}
+          return cid;
+        }} catch(e) {{ return '{uuid.uuid4().hex}'; }}
+      }}
+      function openWithCid() {{
+        const cid = encodeURIComponent(getCid());
+        window.location.href = '{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid=' + cid;
+      }}
     </script>
-    <button onclick="openWithCid()" style="padding:12px 14px;background:#2b6cb0;color:white;border:none;border-radius:8px;">Open on this device (mobile-safe)</button>
+    <button onclick="openWithCid()" style="padding:12px 14px;background:#2b6cb0;color:white;border:none;border-radius:8px;">Open on this device</button>
     """
     st.components.v1.html(js2, height=100)
 
 st.markdown("---")
 st.header("Mark Your Attendance")
-st.write("Use the Direct link (open in new tab) on PC or Scan the QR / use the Open-on-this-device button on phone.")
+st.write("Use the Direct link (open in new tab on PC) or scan the QR / use 'Open on this device' on phone.")
 
-# ---------- very small visible debug for testing ----------
+# ----------- form handling -----------
 params = st.experimental_get_query_params()
-st.caption("DEBUG (visible) — helps testing. Remove later.")
-st.text(f"DEBUG: incoming params: {params}")
-st.text(f"DEBUG: current slot: {slot_key}")
-st.text(f"DEBUG: canonical link: {canonical_link}")
-
-# ---------- validation ----------
 valid = False
 cid = None
 if "key" in params and "s" in params:
     if params.get("s", [""])[0] == QR_SECRET and params.get("key", [""])[0] == slot_key:
         valid = True
         cid = params.get("cid", [None])[0]
-    else:
-        st.warning("QR invalid or expired. Reload the admin page and use the fresh Direct link or QR shown there.")
 
-# ---------- form ----------
 with st.form("form"):
     name = st.text_input("Full name")
     email = st.text_input("Email")
@@ -202,7 +191,7 @@ if submit:
     if not name.strip() or not email.strip():
         st.error("Enter name and email.")
     elif not valid:
-        st.error("You must open via the Direct link or QR for this slot. Click 'Open in new tab' (Direct link) on this computer OR use the mobile-safe button on your phone.")
+        st.error("You must open via the Direct link or current QR for this slot.")
     else:
         df = read_df()
         dup_cid = False
@@ -223,27 +212,27 @@ if submit:
                 st.error("Save failed.")
                 st.text(f"Error: {err}")
 
+# ----------- admin panel & exports -----------
 st.markdown("---")
-with st.expander("Admin — View / Download (password)"):
+with st.expander("Admin — View / Download records (password protected)"):
     pw = st.text_input("Admin password", type="password")
     if st.button("Show"):
         if pw == ADMIN_PASSWORD:
             try:
                 df = read_df()
-                if df.empty:
+                df_display = df_for_admin_display(df)
+                if df_display.empty:
                     st.info("No records yet.")
                 else:
-                    st.dataframe(df)
-                    csvb = df.to_csv(index=False).encode("utf-8")
-                    st.download_button("Download CSV", data=csvb, file_name="attendance.csv")
+                    st.dataframe(df_display)
+                    csvb = df_display.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download CSV", data=csvb, file_name="attendance.csv", mime="text/csv")
                     try:
                         excel = df_to_excel_bytes(df)
-                        st.download_button("Download XLSX", data=excel, file_name="attendance.xlsx")
+                        st.download_button("Download Excel (.xlsx)", data=excel, file_name="attendance.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                     except Exception as e:
                         st.error("Excel export failed.")
                         st.text(str(e))
-            except Exception as e:
-                st.error("Failed to load.")
-                st.text(str(e))
-
-st.caption("One submission per browser per slot (via cid) and one submission per email per slot are enforced.")
+        else:
+            st.error("Wrong admin password.")
+st.caption("One submission per browser per slot and one email per slot enforced. cid is stored for enforcement but not exported to reports.")
