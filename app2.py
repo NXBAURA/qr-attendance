@@ -1,18 +1,20 @@
-# app2.py - Stable QR attendance app
-# - Shared slot stored in data/current_slot.json
-# - Enforces one submission per device (cid)
-# - Admin: view, download CSV/XLSX, Archive, Clear
-# - Exports: timestamp (formatted), slot_key, name, email (cid not exported)
+# app2.py - Enforce cid-only opening. No "open without cid" or direct raw link.
 import streamlit as st
 from pathlib import Path
 import qrcode
 from io import BytesIO
-import csv, json, os, time, urllib.parse, hashlib, uuid, shutil
+import csv
+import json
+import os
+import time
+import urllib.parse
+import hashlib
+import uuid
 from datetime import datetime
 import pandas as pd
-from string import Template
+import shutil
 
-# ---------- Page config ----------
+# ---------- config ----------
 st.set_page_config(page_title="QR Attendance", layout="centered")
 try:
     sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
@@ -20,10 +22,10 @@ except Exception:
     sha = "no-sha"
 st.sidebar.text(f"app2.py SHA: {sha}")
 
-# ---------- Secrets & paths (set these in Streamlit Cloud secrets) ----------
+# ---------- secrets & paths ----------
 QR_SECRET = st.secrets.get("QR_SECRET", "changeme")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
-BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")  # must match app host exactly
+BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,10 +33,9 @@ CSV_PATH = DATA_DIR / "attendance.csv"
 SLOT_FILE = DATA_DIR / "current_slot.json"
 ARCHIVE_DIR = DATA_DIR / "archive"
 ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+SLOT_TTL = 300  # seconds
 
-SLOT_TTL = 300  # seconds (5 minutes)
-
-# ---------- Helpers ----------
+# ---------- helpers ----------
 def now_iso_utc():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
@@ -46,8 +47,7 @@ def atomic_write_json(path: Path, data: dict):
     tmp.replace(path)
 
 def read_slot_file(path: Path):
-    if not path.exists():
-        return None
+    if not path.exists(): return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -108,12 +108,11 @@ def read_df():
         return pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"])
 
 def df_for_admin_display(df: pd.DataFrame):
-    if df.empty:
-        return df
+    if df.empty: return df
     df2 = df.copy()
     def fmt_ts(x):
         try:
-            dt = datetime.fromisoformat(str(x).replace("Z", ""))
+            dt = datetime.fromisoformat(str(x).replace("Z",""))
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return x
@@ -135,8 +134,7 @@ def archive_records():
     dest = ARCHIVE_DIR / f"attendance_archive_{ts}.csv"
     try:
         if CSV_PATH.exists():
-            shutil_move = shutil.move
-            shutil_move(str(CSV_PATH), str(dest))
+            shutil.move(str(CSV_PATH), str(dest))
         pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"]).to_csv(CSV_PATH, index=False)
         return True, str(dest)
     except Exception as e:
@@ -149,108 +147,60 @@ def clear_records():
     except Exception as e:
         return False, str(e)
 
-# ---------- Shared slot ----------
+# ---------- shared slot ----------
 slot_key, slot_created = ensure_current_slot(SLOT_TTL)
 expires_in = int(SLOT_TTL - (time.time() - slot_created))
-canonical_link = build_link(slot_key)  # link without cid
+canonical_link = build_link(slot_key)  # note: no-cid raw link kept internally but not shown for direct use
 
 # ---------- UI ----------
-st.title("📋 QR Attendance Marker — device-locked")
+st.title("📋 QR Attendance (cid required)")
 
-col1, col2 = st.columns([1,1])
+left, right = st.columns([1,1])
 
-with col1:
+with left:
     st.subheader("Admin — Current QR")
     st.write("Current slot key:", f"`{slot_key}`")
     st.write(f"QR refreshes every 5 minutes • refresh in **{expires_in}s**")
-    st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with phone camera")
-    st.markdown("**Direct link (open in new tab or copy):**")
-    st.markdown(f"[Open direct attendance link]({canonical_link})")
-    # Prepare fallback cid value (safe, precomputed)
-    fallback_cid = uuid.uuid4().hex
+    st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with camera")
+    st.markdown("**Open / copy links below will always attach your browser's device id (cid).**")
 
-    admin_js_template = Template("""
+    # Open in new tab WITH cid, and copy-with-cid buttons (JS obtains localStorage cid)
+    js = f"""
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <button id="openWithCid" style="padding:8px 10px;border-radius:6px;background:#2b6cb0;color:white;border:none;">Open in new tab (with cid)</button>
-      <button id="openNoCid" style="padding:8px 10px;border-radius:6px;background:#4a5568;color:white;border:none;">Open in new tab (no cid)</button>
-      <button id="copyBtn" style="padding:8px 10px;border-radius:6px;background:#718096;color:white;border:none;">Copy link</button>
+      <button id="copyWithCid" style="padding:8px 10px;border-radius:6px;background:#718096;color:white;border:none;">Copy link (with cid)</button>
     </div>
     <script>
-      function getCidLocal(){ 
-        try{ 
-          let c = localStorage.getItem('attendance_cid'); 
-          if(!c){ 
-            c = (crypto && crypto.randomUUID) ? crypto.randomUUID() : "$fallback_cid"; 
-            localStorage.setItem('attendance_cid', c);
-          }
-          return c;
-        } catch(e) {
-          return "$fallback_cid";
-        }
-      }
-      document.getElementById('openWithCid').onclick = function(){
-        const cid = encodeURIComponent(getCidLocal());
-        window.open("$base_url/?key=$slot_key&s=$qr_secret&cid=" + cid, "_blank");
-      };
-      document.getElementById('openNoCid').onclick = function(){
-        window.open("$canonical_link", "_blank");
-      };
-      document.getElementById('copyBtn').onclick = async function(){
-        try{ await navigator.clipboard.writeText("$canonical_link"); this.innerText='Copied'; setTimeout(()=>this.innerText='Copy link',1200); } catch(e) { alert('Copy failed'); }
-      };
+      function getCidLocal(){ try{ let c=localStorage.getItem('attendance_cid'); if(!c){ c=(crypto && crypto.randomUUID)?crypto.randomUUID(): '{uuid.uuid4().hex}'; localStorage.setItem('attendance_cid',c);} return c}catch(e){return '{uuid.uuid4().hex}'} }
+      document.getElementById('openWithCid').onclick = function(){ const cid = encodeURIComponent(getCidLocal()); window.open("{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid="+cid, "_blank"); }
+      document.getElementById('copyWithCid').onclick = async function(){ try{ const cid = encodeURIComponent(getCidLocal()); const url = "{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid="+cid; await navigator.clipboard.writeText(url); this.innerText='Copied'; setTimeout(()=>this.innerText='Copy link (with cid)',1200);}catch(e){alert('Copy failed')} }
     </script>
-    """)
+    """
+    st.components.v1.html(js, height=90)
 
-    admin_js = admin_js_template.substitute(
-        fallback_cid=fallback_cid,
-        base_url=BASE_URL,
-        slot_key=slot_key,
-        qr_secret=QR_SECRET,
-        canonical_link=canonical_link
-    )
-    st.components.v1.html(admin_js, height=100)
-
-with col2:
+with right:
     st.markdown("### Open on this device (mobile-safe)")
-    fallback_cid2 = uuid.uuid4().hex
-    mobile_js_template = Template("""
+    js2 = f"""
     <script>
-    function getCid2(){
-      try{
-        let c = localStorage.getItem('attendance_cid');
-        if(!c){ c = (crypto && crypto.randomUUID) ? crypto.randomUUID() : "$fallback_cid";
-          localStorage.setItem('attendance_cid', c);
-        }
-        return c;
-      } catch(e) { return "$fallback_cid"; }
-    }
-    function openWithCid2(){
-      const cid = encodeURIComponent(getCid2());
-      window.location.href = "$base_url/?key=$slot_key&s=$qr_secret&cid=" + cid;
-    }
+    function getCid2(){ try{ let c=localStorage.getItem('attendance_cid'); if(!c){ c=(crypto && crypto.randomUUID)?crypto.randomUUID(): '{uuid.uuid4().hex}'; localStorage.setItem('attendance_cid',c);} return c;}catch(e){return '{uuid.uuid4().hex}'} }
+    function openWithCid2(){ const cid = encodeURIComponent(getCid2()); window.location.href = '{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid=' + cid; }
     </script>
     <button onclick="openWithCid2()" style="padding:12px 14px;background:#2b6cb0;color:white;border:none;border-radius:8px;">Open on this device (with cid)</button>
-    """)
-    mobile_js = mobile_js_template.substitute(
-        fallback_cid=fallback_cid2,
-        base_url=BASE_URL,
-        slot_key=slot_key,
-        qr_secret=QR_SECRET
-    )
-    st.components.v1.html(mobile_js, height=100)
+    """
+    st.components.v1.html(js2, height=100)
 
 st.markdown("---")
 st.header("Mark Your Attendance")
-st.write("Important: submissions require a device id (cid). Use 'Open on this device' or 'Open in new tab (with cid)' to set it. Links without cid will be rejected.")
+st.write("Links without a device id (cid) are rejected. Use the buttons above so your browser includes cid, then submit once.")
 
-# ---------- Attendance submission (requires cid) ----------
+# ---------- form ----------
 params = st.experimental_get_query_params()
 cid = None
 valid = False
 if "key" in params and "s" in params and "cid" in params:
-    if params.get("s", [""])[0] == QR_SECRET and params.get("key", [""])[0] == slot_key:
-        cid = params.get("cid", [None])[0]
-        if cid and len(str(cid)) > 8:
+    if params.get("s",[None])[0] == QR_SECRET and params.get("key",[None])[0] == slot_key:
+        cid = params.get("cid",[None])[0]
+        if cid and len(str(cid))>8:
             valid = True
 
 with st.form("attendance"):
@@ -262,10 +212,9 @@ if submit:
     if not name.strip() or not email.strip():
         st.error("Enter name and email.")
     elif not valid:
-        st.error("Submission blocked: link does not include a device identifier (cid). Click 'Open on this device' or 'Open in new tab (with cid)' and try again.")
+        st.error("Submission blocked: this link does not include a device identifier (cid). Use 'Open on this device' or 'Open in new tab (with cid)' above.")
     else:
         df = read_df()
-        dup_cid = False
         try:
             dup_cid = ((df['slot_key'] == slot_key) & (df.get('cid','') == cid)).any()
         except Exception:
@@ -282,8 +231,6 @@ if submit:
                 st.text(f"Error: {err}")
 
 st.markdown("---")
-
-# ---------- Admin panel: view, download, archive, clear ----------
 with st.expander("Admin — View / Archive / Clear records (password protected)"):
     pw = st.text_input("Admin password", type="password")
     if st.button("Show records"):
@@ -334,4 +281,4 @@ with st.expander("Admin — View / Archive / Clear records (password protected)"
             else:
                 st.error(f"Clear failed: {info}")
 
-st.caption("Notes: cid is recorded for enforcement (one device per slot) but not exported to reports by default.")
+st.caption("Notes: cid is recorded for enforcement but not shown in admin exports. Use Archive to keep backups before clearing.")
