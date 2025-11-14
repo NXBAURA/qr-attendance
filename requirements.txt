@@ -1,5 +1,5 @@
 streamlit
 pandas
-qrcode
-Pillow
+qrcode[pil]
+pillow
 openpyxl
