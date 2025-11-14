@@ -1,10 +1,4 @@
-# app.py - Fresh, robust QR attendance app
-# - Always requires cid (auto-injected when user opens ?key=..&s=.. without cid)
-# - Shared slot stored in data/current_slot.json (so phone and PC see same slot)
-# - Admin: view records, download CSV/XLSX, Archive, Clear (with confirmations)
-# - Exports do NOT include cid; cid is stored internally for enforcement only
-# - Timestamp formatted as YYYY-MM-DD HH:MM:SS in admin and exports
-# - Defensive file writes and safe CSV handling
+# app2.py - Auto-cid redirect on QR open + strict device-lock + admin exports
 import streamlit as st
 from pathlib import Path
 from io import BytesIO
@@ -20,20 +14,19 @@ import shutil
 from datetime import datetime
 import pandas as pd
 
-# -------------------- Page config --------------------
+# ---------- Page config & SHA ----------
 st.set_page_config(page_title="QR Attendance", layout="centered")
 try:
     sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 except Exception:
     sha = "no-sha"
-st.sidebar.text(f"app.py SHA: {sha}")
+st.sidebar.text(f"app2.py SHA: {sha}")
 
-# -------------------- Secrets / Config --------------------
+# ---------- Secrets & paths ----------
 QR_SECRET = st.secrets.get("QR_SECRET", "changeme")
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
-BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")  # must match your app host
+BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")  # must match exactly
 
-# -------------------- Paths --------------------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH = DATA_DIR / "attendance.csv"
@@ -41,14 +34,13 @@ SLOT_FILE = DATA_DIR / "current_slot.json"
 ARCHIVE_DIR = DATA_DIR / "archive"
 ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
-SLOT_TTL = 300  # 5 minutes
+SLOT_TTL = 300  # seconds
 
-# -------------------- Utilities --------------------
+# ---------- Utilities ----------
 def now_iso_utc():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-def now_local_str(iso_z: str):
-    # convert ISO-Z to readable local-like string (server local)
+def local_fmt(iso_z):
     try:
         dt = datetime.fromisoformat(iso_z.replace("Z", ""))
         return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -59,8 +51,7 @@ def atomic_write_json(path: Path, data: dict):
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
-        f.flush()
-        os.fsync(f.fileno())
+        f.flush(); os.fsync(f.fileno())
     tmp.replace(path)
 
 def read_json_safe(path: Path):
@@ -80,7 +71,6 @@ def ensure_shared_slot(ttl=SLOT_TTL):
         created = int(data.get("created", 0))
         if slot and (now_ts - created) <= ttl:
             return slot, created
-    # generate new
     new_slot = uuid.uuid4().hex
     payload = {"slot_key": new_slot, "created": now_ts}
     try:
@@ -113,17 +103,14 @@ def safe_append_csv(row: dict):
         with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
             if not exists:
-                writer.writeheader()
-                f.flush(); os.fsync(f.fileno())
-            writer.writerow(row)
-            f.flush(); os.fsync(f.fileno())
+                writer.writeheader(); f.flush(); os.fsync(f.fileno())
+            writer.writerow(row); f.flush(); os.fsync(f.fileno())
         return True, ""
     except Exception as e:
         return False, str(e)
 
 def read_attendance_df():
     if not CSV_PATH.exists():
-        # create header
         pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"]).to_csv(CSV_PATH, index=False)
         return pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"])
     try:
@@ -132,12 +119,11 @@ def read_attendance_df():
         return pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"])
 
 def df_for_export(df: pd.DataFrame):
-    # return dataframe for admin view & export WITHOUT cid and with friendly timestamp
     if df.empty:
         return df
     df2 = df.copy()
     if "timestamp" in df2.columns:
-        df2["timestamp"] = df2["timestamp"].apply(now_local_str)
+        df2["timestamp"] = df2["timestamp"].apply(local_fmt)
     cols = [c for c in ["timestamp","slot_key","name","email"] if c in df2.columns]
     return df2.loc[:, cols]
 
@@ -155,7 +141,6 @@ def archive_current_csv():
     try:
         if CSV_PATH.exists():
             shutil.move(str(CSV_PATH), str(dest))
-        # create new empty file
         pd.DataFrame(columns=["timestamp","slot_key","name","email","cid"]).to_csv(CSV_PATH, index=False)
         return True, str(dest)
     except Exception as e:
@@ -168,12 +153,12 @@ def clear_current_csv():
     except Exception as e:
         return False, str(e)
 
-# -------------------- Shared slot (single source of truth) --------------------
+# ---------- Shared slot ----------
 slot_key, slot_created = ensure_shared_slot(SLOT_TTL)
 expires_in = int(SLOT_TTL - (time.time() - slot_created))
-canonical_link = build_link(slot_key)  # link WITHOUT cid - QR will encode this
+canonical_link = build_link(slot_key)  # QR encodes this canonical link (no cid)
 
-# -------------------- UI --------------------
+# ---------- UI ----------
 st.title("📋 QR Attendance Marker")
 
 left, right = st.columns([1,1])
@@ -182,16 +167,15 @@ with left:
     st.subheader("Admin — Current QR")
     st.write("Current slot key:", f"`{slot_key}`")
     st.write(f"QR refreshes every 5 minutes • refresh in **{expires_in}s**")
-    st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with your phone camera")
-    st.markdown("**Open / copy links below will attach your browser's device id (cid).**")
-    # Buttons: Open in new tab (with cid), Copy link (with cid), Open on device (with cid)
+    st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with phone camera")
+    st.markdown("**Buttons below will attach your browser's device id (cid) automatically.**")
     js_admin = f"""
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <button id="openWithCid" style="padding:8px 10px;border-radius:6px;background:#2b6cb0;color:white;border:none;">Open in new tab (with cid)</button>
       <button id="copyWithCid" style="padding:8px 10px;border-radius:6px;background:#718096;color:white;border:none;">Copy link (with cid)</button>
     </div>
     <script>
-      function getCidLocal(){ try{{ let c=localStorage.getItem('attendance_cid'); if(!c){ c=(crypto && crypto.randomUUID)?crypto.randomUUID(): '{uuid.uuid4().hex}'; localStorage.setItem('attendance_cid', c);} return c; }}catch(e){{ return '{uuid.uuid4().hex}';}} }
+      function getCidLocal(){ try{ let c=localStorage.getItem('attendance_cid'); if(!c){ c=(crypto && crypto.randomUUID)?crypto.randomUUID(): '{uuid.uuid4().hex}'; localStorage.setItem('attendance_cid', c);} return c; }catch(e){ return '{uuid.uuid4().hex}'; }}
       document.getElementById('openWithCid').onclick = function(){ const cid = encodeURIComponent(getCidLocal()); window.open("{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid="+cid, "_blank"); }
       document.getElementById('copyWithCid').onclick = async function(){ try{ const cid = encodeURIComponent(getCidLocal()); const url = "{BASE_URL}/?key={slot_key}&s={QR_SECRET}&cid="+cid; await navigator.clipboard.writeText(url); this.innerText='Copied'; setTimeout(()=>this.innerText='Copy link (with cid)',1200);}catch(e){alert('Copy failed')} }
     </script>
@@ -222,17 +206,14 @@ with right:
 
 st.markdown("---")
 st.header("Mark Your Attendance")
-st.write("This app enforces one submission per device (cid). Scanning the QR will auto-add a cid when possible and redirect you so you can submit immediately.")
+st.write("Scanning the QR will auto-inject a device id (cid) when possible and reload the page so you can submit immediately. Links without cid will be rejected.")
 
-# -------------------- Query params & auto-cid redirect --------------------
+# ---------- Auto-cid injection: if key+s valid but no cid, create cid in localStorage and redirect with cid ----------
 params = st.experimental_get_query_params()
-
-# If user opened valid key+s but without cid: inject JS to set/get localStorage.attendance_cid and redirect with cid.
 if "key" in params and "s" in params:
     s_ok = params.get("s", [""])[0] == QR_SECRET
     key_ok = params.get("key", [""])[0] == slot_key
     if s_ok and key_ok and "cid" not in params:
-        # auto-create cid in browser and redirect to same URL with &cid=...
         js_auto = f"""
         <script>
         (function() {{
@@ -247,16 +228,17 @@ if "key" in params and "s" in params:
             params.set('cid', cid);
             window.location.replace(base + '?' + params.toString());
           }} catch (e) {{
+            // If auto-redirect fails (e.g. JS blocked), user can use Open on this device button
             console.error('auto-cid failed', e);
           }}
         }})();
         </script>
         """
         st.components.v1.html(js_auto, height=1)
-        st.stop()  # stop further rendering until redirect happens
+        st.stop()
 
-# -------------------- Validate incoming params (must include cid) --------------------
-params = st.experimental_get_query_params()  # refresh after potential redirect
+# ---------- validate incoming params (must include cid to submit) ----------
+params = st.experimental_get_query_params()
 valid_link = False
 cid = None
 if "key" in params and "s" in params and "cid" in params:
@@ -265,20 +247,19 @@ if "key" in params and "s" in params and "cid" in params:
         if cid and len(str(cid)) > 8:
             valid_link = True
 
-# -------------------- Attendance form --------------------
-with st.form("attendance_form"):
-    name = st.text_input("Full name", max_chars=80)
-    email = st.text_input("Email", max_chars=120)
+# ---------- form ----------
+with st.form("form"):
+    name = st.text_input("Full name")
+    email = st.text_input("Email")
     submitted = st.form_submit_button("Mark Attendance")
 
 if submitted:
     if not name.strip() or not email.strip():
         st.error("Please enter both name and email.")
     elif not valid_link:
-        st.error("This link does not include a valid device identifier (cid). Use 'Open on this device' or 'Open in new tab (with cid)' and try again.")
+        st.error("Submission blocked: the page does not include a valid device id (cid). Use 'Open on this device (with cid)' if auto-redirect failed.")
     else:
         df = read_attendance_df()
-        # block duplicate submission from same device for this slot
         try:
             dup = ((df['slot_key'] == slot_key) & (df.get('cid', '') == cid)).any()
         except Exception:
@@ -286,13 +267,7 @@ if submitted:
         if dup:
             st.error("This device (browser) has already submitted attendance for this slot.")
         else:
-            row = {
-                "timestamp": now_iso_utc(),
-                "slot_key": slot_key,
-                "name": name.strip(),
-                "email": email.strip(),
-                "cid": cid or ""
-            }
+            row = {"timestamp": now_iso_utc(), "slot_key": slot_key, "name": name.strip(), "email": email.strip(), "cid": cid or ""}
             ok, err = safe_append_csv(row)
             if ok:
                 st.success("Attendance marked — thank you!")
@@ -300,7 +275,7 @@ if submitted:
                 st.error("Failed to save attendance.")
                 st.text(f"Error: {err}")
 
-# -------------------- Admin panel --------------------
+# ---------- admin panel ----------
 st.markdown("---")
 with st.expander("Admin — View / Archive / Clear records (password protected)"):
     pw = st.text_input("Admin password", type="password")
@@ -352,4 +327,4 @@ with st.expander("Admin — View / Archive / Clear records (password protected)"
             else:
                 st.error(f"Clear failed: {info}")
 
-st.caption("Records export does not include cid. cid is recorded for enforcement only (one submission per browser per slot).")
+st.caption("Records export excludes cid. cid is recorded for enforcement only (one submission per browser per slot). If QR-scanner opens a viewer that blocks JS, use the 'Open on this device (with cid)' button as fallback.")
