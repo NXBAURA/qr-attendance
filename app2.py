@@ -1,4 +1,4 @@
-# app2.py - Robust QR attendance with reliable mobile button + direct link + copy
+# app2.py - Fixed: import html + robust QR attendance app
 import streamlit as st
 from pathlib import Path
 import qrcode
@@ -11,6 +11,7 @@ import uuid
 import urllib.parse
 import hashlib
 import pandas as pd
+import html  # <-- fixed: required for html.escape
 
 # ---------------- Page config ----------------
 st.set_page_config(page_title="QR Attendance", layout="centered")
@@ -22,10 +23,9 @@ except Exception:
 st.sidebar.text(f"app2.py SHA: {sha}")
 
 # ---------------- Secrets / Config ----------------
-QR_SECRET = st.secrets.get("QR_SECRET", "qrcodegenerate")  # if you see qrcodegenerate, change secret in Streamlit Secrets
+QR_SECRET = st.secrets.get("QR_SECRET", "qrcodegenerate")  # change in Streamlit Secrets if needed
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
 BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")
-# IMPORTANT: BASE_URL must exactly match your app's public URL (no #fragment)
 
 # ---------------- Data paths ----------------
 DATA_DIR = Path("data")
@@ -104,28 +104,30 @@ with left:
     st.subheader("Admin — Current QR")
     st.write("Current slot key:", f"`{slot_key}`")
     st.write(f"QR refreshes every 5 minutes • refresh in **{expires_in}s**")
-    # build canonical link (no cid) for display
     canonical_link = build_qr_link(slot_key)
     st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with phone camera")
     st.markdown("**Direct link (click or copy):**")
-    # show link and Copy button (JS)
+    # safe HTML block - escape link text and guard in case html.escape fails (shouldn't)
+    safe_link = html.escape(canonical_link)
     link_html = f"""
-    <div style="display:flex;gap:8px;align-items:center;">
-      <a id="directLink" href="{html.escape(canonical_link)}" target="_self" style="word-break:break-all">{html.escape(canonical_link)}</a>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <a id="directLink" href="{safe_link}" target="_self" style="word-break:break-all">{safe_link}</a>
       <button id="copyBtn" style="padding:6px 10px;border-radius:6px;background:#2b6cb0;color:white;border:none;margin-left:6px;">Copy</button>
     </div>
     <script>
       const copyBtn = document.getElementById('copyBtn');
       const directLink = document.getElementById('directLink');
-      copyBtn.onclick = async () => {{
-        try {{
-          await navigator.clipboard.writeText(directLink.href);
-          copyBtn.innerText = "Copied";
-          setTimeout(()=>copyBtn.innerText="Copy",1500);
-        }} catch(e) {{
-          alert('Copy failed — please long-press the link to copy.');
-        }}
-      }};
+      if (copyBtn && directLink) {{
+        copyBtn.onclick = async () => {{
+          try {{
+            await navigator.clipboard.writeText(directLink.href);
+            copyBtn.innerText = "Copied";
+            setTimeout(()=>copyBtn.innerText="Copy",1500);
+          }} catch(e) {{
+            alert('Copy failed — long-press link to copy.');
+          }}
+        }};
+      }}
     </script>
     """
     st.components.v1.html(link_html, height=80)
@@ -133,14 +135,12 @@ with left:
 with right:
     st.markdown("### Quick open (mobile-safe)")
     st.write("Click this on the device/browser you want to submit from. It will create a persistent client-id (stored in your browser) and redirect you with `?key=..&s=..&cid=..` so the server can allow one submission per browser.")
-    # JS button: create/keep cid in localStorage, redirect with correct params
     js_button = f"""
     <script>
     function getCid() {{
       try {{
         let cid = localStorage.getItem("attendance_cid");
         if (!cid) {{
-          // use crypto API if available, otherwise fallback
           cid = (crypto && crypto.randomUUID) ? crypto.randomUUID() : "{uuid.uuid4().hex}";
           localStorage.setItem("attendance_cid", cid);
         }}
@@ -155,7 +155,6 @@ with right:
       const s = "{QR_SECRET}";
       const base = window.location.origin + window.location.pathname;
       const url = base + "?key=" + key + "&s=" + s + "&cid=" + cid;
-      // use replace to avoid leaving fragment/history pages
       window.location.replace(url);
     }}
     </script>
