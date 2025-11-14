@@ -389,3 +389,4 @@ with st.expander("Admin — View / Archive / Clear records (password protected)"
                 st.error(f"Clear failed: {info}")
 
 st.caption("Notes: cid is recorded for enforcement (one device per slot) but not exported to reports by default.")
+#end
