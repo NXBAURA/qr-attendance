@@ -1,4 +1,4 @@
-# app.py - Robust QR attendance with per-browser lock (cid) + CSV & Excel downloads
+# app2.py - Robust QR attendance with reliable mobile button + direct link + copy
 import streamlit as st
 from pathlib import Path
 import qrcode
@@ -11,40 +11,41 @@ import uuid
 import urllib.parse
 import hashlib
 import pandas as pd
-import html
 
-# ---------------- page config ----------------
+# ---------------- Page config ----------------
 st.set_page_config(page_title="QR Attendance", layout="centered")
-
-# show file SHA in sidebar so you can confirm deployment
+# SHA for confirmation
 try:
     sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
 except Exception:
     sha = "no-sha"
-st.sidebar.text(f"app.py SHA: {sha}")
+st.sidebar.text(f"app2.py SHA: {sha}")
 
-# ---------------- config / secrets ----------------
-QR_SECRET = st.secrets.get("QR_SECRET", "dev-secret")
+# ---------------- Secrets / Config ----------------
+QR_SECRET = st.secrets.get("QR_SECRET", "qrcodegenerate")  # if you see qrcodegenerate, change secret in Streamlit Secrets
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
 BASE_URL = st.secrets.get("BASE_URL", "https://qr-attendance.streamlit.app")
+# IMPORTANT: BASE_URL must exactly match your app's public URL (no #fragment)
 
-# ---------------- data paths ----------------
+# ---------------- Data paths ----------------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CSV_PATH = DATA_DIR / "attendance.csv"
 
-# ---------------- helpers ----------------
+# ---------------- Helpers ----------------
 def now_iso_utc():
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 def gen_slot_key():
     return uuid.uuid4().hex
 
-def build_qr_link(slot_key: str):
+def build_qr_link(slot_key: str, include_cid: str = None):
     params = {"key": slot_key, "s": QR_SECRET}
+    if include_cid:
+        params["cid"] = include_cid
     return f"{BASE_URL}/?{urllib.parse.urlencode(params)}"
 
-def make_qr_bytes(link: str, box_size=6):
+def make_qr_bytes(link: str):
     img = qrcode.make(link)
     b = BytesIO()
     img.save(b, format="PNG")
@@ -81,7 +82,7 @@ def df_to_excel_bytes(df: pd.DataFrame):
     bio.seek(0)
     return bio.getvalue()
 
-# ---------------- slot rotate (5 minutes) ----------------
+# ---------------- Slot rotation (5 minutes) ----------------
 SLOT_TTL = 300
 if "slot_key" not in st.session_state:
     st.session_state.slot_key = gen_slot_key()
@@ -94,56 +95,88 @@ if time.time() - st.session_state.slot_created > SLOT_TTL:
 slot_key = st.session_state.slot_key
 expires_in = int(SLOT_TTL - (time.time() - st.session_state.slot_created))
 
-# ---------------- UI layout ----------------
+# ---------------- UI ----------------
 st.title("📋 QR Attendance Marker")
 
-col1, col2 = st.columns([1,1])
+left, right = st.columns([1,1])
 
-with col1:
+with left:
     st.subheader("Admin — Current QR")
     st.write("Current slot key:", f"`{slot_key}`")
     st.write(f"QR refreshes every 5 minutes • refresh in **{expires_in}s**")
-    qr_link = build_qr_link(slot_key)
-    st.image(make_qr_bytes(qr_link), width=220, caption="Scan this QR with camera")
-    st.write("Or open link:", qr_link)
+    # build canonical link (no cid) for display
+    canonical_link = build_qr_link(slot_key)
+    st.image(make_qr_bytes(canonical_link), width=220, caption="Scan this QR with phone camera")
+    st.markdown("**Direct link (click or copy):**")
+    # show link and Copy button (JS)
+    link_html = f"""
+    <div style="display:flex;gap:8px;align-items:center;">
+      <a id="directLink" href="{html.escape(canonical_link)}" target="_self" style="word-break:break-all">{html.escape(canonical_link)}</a>
+      <button id="copyBtn" style="padding:6px 10px;border-radius:6px;background:#2b6cb0;color:white;border:none;margin-left:6px;">Copy</button>
+    </div>
+    <script>
+      const copyBtn = document.getElementById('copyBtn');
+      const directLink = document.getElementById('directLink');
+      copyBtn.onclick = async () => {{
+        try {{
+          await navigator.clipboard.writeText(directLink.href);
+          copyBtn.innerText = "Copied";
+          setTimeout(()=>copyBtn.innerText="Copy",1500);
+        }} catch(e) {{
+          alert('Copy failed — please long-press the link to copy.');
+        }}
+      }};
+    </script>
+    """
+    st.components.v1.html(link_html, height=80)
 
-with col2:
+with right:
     st.markdown("### Quick open (mobile-safe)")
     st.write("Click this on the device/browser you want to submit from. It will create a persistent client-id (stored in your browser) and redirect you with `?key=..&s=..&cid=..` so the server can allow one submission per browser.")
-    # client-side redirect button using localStorage to store cid
-    safe_js = f"""
+    # JS button: create/keep cid in localStorage, redirect with correct params
+    js_button = f"""
     <script>
-    // Ensure strong id in localStorage
     function getCid() {{
-      let cid = localStorage.getItem("attendance_cid");
-      if (!cid) {{
-        // create a v4-like id
-        cid = crypto.randomUUID ? crypto.randomUUID() : '{uuid.uuid4().hex}';
-        localStorage.setItem("attendance_cid", cid);
+      try {{
+        let cid = localStorage.getItem("attendance_cid");
+        if (!cid) {{
+          // use crypto API if available, otherwise fallback
+          cid = (crypto && crypto.randomUUID) ? crypto.randomUUID() : "{uuid.uuid4().hex}";
+          localStorage.setItem("attendance_cid", cid);
+        }}
+        return cid;
+      }} catch(e) {{
+        return "{uuid.uuid4().hex}";
       }}
-      return cid;
     }}
-    function redirect() {{
+    function redirectToAttendance() {{
       const cid = encodeURIComponent(getCid());
       const key = "{slot_key}";
       const s = "{QR_SECRET}";
       const base = window.location.origin + window.location.pathname;
       const url = base + "?key=" + key + "&s=" + s + "&cid=" + cid;
-      window.location.href = url;
+      // use replace to avoid leaving fragment/history pages
+      window.location.replace(url);
     }}
     </script>
-    <button onclick="redirect()" style="padding:12px 18px;border-radius:6px;background:#2b6cb0;color:white;border:none;font-size:15px;">
-      Open attendance link on this device (mobile-safe)
-    </button>
+    <div><button onclick="redirectToAttendance()" style="padding:12px 14px;background:#2b6cb0;color:white;border:none;border-radius:8px;">Open attendance link on this device (mobile-safe)</button></div>
     """
-    st.components.v1.html(safe_js, height=80)
+    st.components.v1.html(js_button, height=100)
 
 st.markdown("---")
 st.header("Mark Your Attendance")
-st.write("Open the link from the QR or use the button above to ensure the link has correct params for this slot.")
+st.write("Open the link from the QR or use the button above so the link has the correct params for this slot.")
 
-# ---------------- validate incoming query params ----------------
+# ---------------- debug (visible) ----------------
 params = st.experimental_get_query_params()
+st.caption("DEBUG: small info (remove later if you want).")
+st.text(f"DEBUG: query params: {params}")
+st.text(f"DEBUG: slot_key: {slot_key}")
+st.text(f"DEBUG: s==secret? {params.get('s',[''])[0] == QR_SECRET}")
+st.text(f"DEBUG: key==slot? {params.get('key',[''])[0] == slot_key}")
+st.text(f"DEBUG: BASE_URL (secret): {BASE_URL}")
+
+# ---------------- validate incoming params ----------------
 valid_qr = False
 cid = None
 if "key" in params and "s" in params:
@@ -163,14 +196,13 @@ if submitted:
     if not name.strip() or not email.strip():
         st.error("Please enter both name and email.")
     elif not valid_qr:
-        st.error("You must open via a valid admin QR link for this slot. Use the mobile-safe button above.")
+        st.error("You must open via a valid admin QR link for this slot. Use the mobile-safe button or the direct link above.")
     else:
         df = read_attendance_df()
-        # check duplicates: by cid for this slot OR by email for this slot
         already_cid = False
         already_email = False
         if cid:
-            already_cid = ((df['slot_key'] == slot_key) & (df.get('cid', '') == cid)).any()
+            already_cid = ((df['slot_key'] == slot_key) & (df.get('cid','') == cid)).any()
         already_email = ((df['slot_key'] == slot_key) & (df['email'].astype(str).str.lower() == email.strip().lower())).any()
         if already_cid:
             st.error("This browser has already submitted attendance for this slot.")
@@ -220,7 +252,3 @@ with st.expander("Admin — View / Download records (password protected)"):
             st.error("Wrong admin password.")
 
 st.caption("Data saved to data/attendance.csv. Each row includes 'cid' (browser id). One submission per browser per slot and one submission per email per slot are enforced.")
-
-# small footer
-st.markdown("---")
-st.caption("If you still see errors, open Manage app → Logs and paste the last 'Attempted file' and 'Error' lines here.")
